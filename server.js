@@ -46,36 +46,54 @@ async function initDB() {
   const connectionString = process.env.DATABASE_URL || process.env.DB_URL;
 
   if (!connectionString && (!process.env.DB_HOST || !process.env.DB_USER)) {
-    console.warn('⚠️ Реквизиты БД не заданы. Задай DATABASE_URL (строку подключения) ИЛИ DB_HOST/DB_USER/DB_PASSWORD/DB_NAME.');
+    console.warn('⚠️ Реквизиты БД не заданы. Задай DATABASE_URL ИЛИ DB_HOST/DB_USER/DB_PASSWORD/DB_NAME.');
     return false;
   }
   try {
+    const poolConfig = {
+      connectionTimeoutMillis: 10000, // 10 сек на подключение, иначе ошибка
+      idleTimeoutMillis: 30000,
+      max: 5
+    };
     if (connectionString) {
-      // Строка вида postgresql://user:pass@host:port/dbname
-      pool = new Pool({
-        connectionString,
-        ssl: connectionString.includes('sslmode=require') ? { rejectUnauthorized: false } : false
-      });
-      console.log('🔗 Подключаюсь по DATABASE_URL');
+      poolConfig.connectionString = connectionString;
+      // Пробуем с SSL если требуется, иначе без
+      poolConfig.ssl = connectionString.includes('sslmode=require')
+        ? { rejectUnauthorized: false }
+        : false;
+      console.log('🔗 Подключаюсь по DATABASE_URL (ssl:', !!poolConfig.ssl, ')');
     } else {
-      pool = new Pool({
-        host: process.env.DB_HOST,
-        port: process.env.DB_PORT || 5432,
-        database: process.env.DB_NAME,
-        user: process.env.DB_USER,
-        password: process.env.DB_PASSWORD,
-        ssl: false
-      });
-      console.log('🔗 Подключаюсь по DB_HOST');
+      poolConfig.host = process.env.DB_HOST;
+      poolConfig.port = process.env.DB_PORT || 5432;
+      poolConfig.database = process.env.DB_NAME;
+      poolConfig.user = process.env.DB_USER;
+      poolConfig.password = process.env.DB_PASSWORD;
+      poolConfig.ssl = false;
+      console.log('🔗 Подключаюсь по DB_HOST:', poolConfig.host);
     }
+
+    pool = new Pool(poolConfig);
+    pool.on('error', (err) => console.error('⚠️ Pool error:', err.message));
+
+    console.log('⏳ Пробую подключиться (таймаут 10с)...');
     const client = await pool.connect();
     console.log('✅ PostgreSQL подключён');
+    const test = await client.query('SELECT NOW()');
+    console.log('✅ Тестовый запрос OK:', test.rows[0].now);
     client.release();
+
+    console.log('⏳ Создаю таблицы...');
     await createTables();
+    console.log('⏳ Заполняю демо-данные...');
     await seedInitialData();
     return true;
   } catch (e) {
     console.error('❌ Ошибка подключения к БД:', e.message);
+    console.error('   Код:', e.code || 'нет кода');
+    // Если упало без SSL — подсказка
+    if (e.message.includes('SSL') || e.message.includes('ssl')) {
+      console.error('💡 Похоже нужен SSL. Добавь в конец DATABASE_URL: ?sslmode=require');
+    }
     pool = null;
     return false;
   }
