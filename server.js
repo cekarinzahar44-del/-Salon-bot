@@ -287,18 +287,19 @@ function mainMenu(isAdminUser) {
   return Markup.inlineKeyboard(buttons);
 }
 
-// ════════ MIDDLEWARE: логирование + защита от падений ════════
+// ════════ MIDDLEWARE: мгновенный ответ на callback + логи + защита ════════
 bot.use(async (ctx, next) => {
   const cb = ctx.callbackQuery?.data;
-  if (cb) console.log(`[callback] ${ctx.from.id} → ${cb}`);
+  if (cb) {
+    console.log(`[callback] ${ctx.from.id} → ${cb}`);
+    // СРАЗУ отвечаем Telegram, чтобы callback не "протух" пока работает БД
+    try { await ctx.answerCbQuery(); } catch (e) {}
+  }
   try {
     await next();
   } catch (err) {
     console.error(`❌ Ошибка в обработчике (${cb || 'msg'}):`, err.message);
     console.error(err.stack);
-    try {
-      if (ctx.callbackQuery) await ctx.answerCbQuery('Произошла ошибка, попробуй ещё раз');
-    } catch (e) {}
   }
 });
 
@@ -319,7 +320,6 @@ bot.command('menu', async (ctx) => {
 
 // ════════ ИНФО О САЛОНЕ ════════
 bot.action('SHOW_INFO', async (ctx) => {
-  await ctx.answerCbQuery();
   const text =
     `🏛 *${SALON_NAME}*\n\n` +
     `📍 *Адрес:* Москва, ул. Примерная, 1\n` +
@@ -334,7 +334,6 @@ bot.action('SHOW_INFO', async (ctx) => {
 
 // ════════ СПИСОК МАСТЕРОВ ════════
 bot.action('SHOW_MASTERS', async (ctx) => {
-  await ctx.answerCbQuery();
   const { rows } = await pool.query('SELECT * FROM masters WHERE is_active = true ORDER BY id');
   let text = `💆 *Наши мастера* (${rows.length}):\n\n`;
   for (const m of rows) {
@@ -348,7 +347,6 @@ bot.action('SHOW_MASTERS', async (ctx) => {
 
 // ════════ СПИСОК УСЛУГ ════════
 bot.action('SHOW_SERVICES', async (ctx) => {
-  await ctx.answerCbQuery();
   const { rows } = await pool.query(`
     SELECT s.*, COUNT(ms.master_id) as masters_count
     FROM services s
@@ -378,7 +376,6 @@ bot.action('SHOW_SERVICES', async (ctx) => {
 });
 
 bot.action('MAIN_MENU', async (ctx) => {
-  await ctx.answerCbQuery();
   clearState(ctx.from.id);
   return ctx.editMessageText(`✨ *${SALON_NAME}*\n\nВыбери что нужно:`, {
     parse_mode: 'Markdown', ...mainMenu(isAdmin(ctx.from.id))
@@ -387,7 +384,6 @@ bot.action('MAIN_MENU', async (ctx) => {
 
 // ════════ ЗАПИСЬ: ШАГ 1 — Выбор категории ════════
 bot.action('BOOK_START', async (ctx) => {
-  await ctx.answerCbQuery();
   clearState(ctx.from.id);
   const text = `📅 *Запись*\n\nШаг 1 из 5 — выбери категорию услуг:`;
   return ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
@@ -399,7 +395,6 @@ bot.action('BOOK_START', async (ctx) => {
 
 // ШАГ 2 — Выбор услуги
 bot.action(/^CAT_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
   const cat = ctx.match[1];
   const { rows } = await pool.query(`SELECT * FROM services WHERE category = $1 AND is_active = true ORDER BY price`, [cat]);
   if (!rows.length) {
@@ -416,7 +411,6 @@ bot.action(/^CAT_(.+)$/, async (ctx) => {
 
 // ШАГ 3 — Выбор мастера
 bot.action(/^SVC_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
   const serviceId = parseInt(ctx.match[1]);
   const { rows: sRows } = await pool.query('SELECT * FROM services WHERE id = $1', [serviceId]);
   if (!sRows.length) return ctx.editMessageText('Услуга не найдена');
@@ -444,7 +438,6 @@ bot.action(/^SVC_(\d+)$/, async (ctx) => {
 
 // ШАГ 4 — Выбор даты
 bot.action(/^MST_(\w+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, начни заново /start');
   const masterId = ctx.match[1] === 'any' ? null : parseInt(ctx.match[1]);
@@ -496,7 +489,6 @@ function getTzOffset() {
 
 // ШАГ 5 — Выбор времени
 bot.action(/^DATE_(.+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, /start');
   const dateStr = ctx.match[1];
@@ -529,7 +521,6 @@ bot.action(/^DATE_(.+)$/, async (ctx) => {
 });
 
 bot.action('BACK_TO_DATE', async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, /start');
   return showDatePicker(ctx, state);
@@ -629,7 +620,6 @@ async function calculateAvailableSlots(masterId, serviceId, dateStr) {
 
 // Подтверждение записи
 bot.action(/^SLOT_(\d+)_(\d{2}:\d{2})$/, async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, /start');
   const masterId = parseInt(ctx.match[1]);
@@ -658,7 +648,6 @@ bot.action(/^SLOT_(\d+)_(\d{2}:\d{2})$/, async (ctx) => {
 });
 
 bot.action('EDIT_CONTACT', async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   state.awaitingContact = true;
   setState(ctx.from.id, state);
@@ -671,7 +660,6 @@ bot.action('EDIT_CONTACT', async (ctx) => {
 });
 
 bot.action('BACK_TO_CONFIRM', async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   state.awaitingContact = false;
   setState(ctx.from.id, state);
@@ -682,7 +670,6 @@ bot.action('BACK_TO_CONFIRM', async (ctx) => {
 });
 
 bot.action('CONFIRM_BOOK', async (ctx) => {
-  await ctx.answerCbQuery();
   const state = getState(ctx.from.id);
   if (!state.serviceId || !state.masterId || !state.time || !state.date) {
     return ctx.editMessageText('Сессия истекла, начни заново /start');
@@ -775,7 +762,6 @@ bot.on('text', async (ctx) => {
 
 // ════════ МОИ ЗАПИСИ ════════
 bot.action('MY_APPTS', async (ctx) => {
-  await ctx.answerCbQuery();
   const { rows } = await pool.query(`
     SELECT a.*, m.name as master_name, s.name as service_name, s.price
     FROM appointments a
@@ -803,7 +789,6 @@ bot.action('MY_APPTS', async (ctx) => {
 });
 
 bot.action(/^CANCEL_(\d+)$/, async (ctx) => {
-  await ctx.answerCbQuery();
   const aptId = parseInt(ctx.match[1]);
   const { rows } = await pool.query(
     `SELECT * FROM appointments WHERE id = $1 AND user_id = $2`,
@@ -825,7 +810,6 @@ bot.action(/^CANCEL_(\d+)$/, async (ctx) => {
 
 // ════════ АДМИН-ПАНЕЛЬ ════════
 bot.action('ADMIN_MENU', async (ctx) => {
-  await ctx.answerCbQuery();
   if (!isAdmin(ctx.from.id)) return;
   return ctx.editMessageText(`⚙️ *Админ-панель*\n\nЧто будем делать?`, {
     parse_mode: 'Markdown', ...Markup.inlineKeyboard([
@@ -840,7 +824,6 @@ bot.action('ADMIN_MENU', async (ctx) => {
 });
 
 bot.action('ADM_TODAY', async (ctx) => {
-  await ctx.answerCbQuery();
   if (!isAdmin(ctx.from.id)) return;
   const today = new Date().toISOString().split('T')[0];
   const { rows } = await pool.query(`
@@ -871,7 +854,6 @@ bot.action('ADM_TODAY', async (ctx) => {
 });
 
 bot.action('ADM_STATS', async (ctx) => {
-  await ctx.answerCbQuery();
   if (!isAdmin(ctx.from.id)) return;
   const stats = await pool.query(`
     SELECT
@@ -921,7 +903,6 @@ bot.action('ADM_STATS', async (ctx) => {
 });
 
 bot.action('ADM_SCHEDULE', async (ctx) => {
-  await ctx.answerCbQuery();
   if (!isAdmin(ctx.from.id)) return;
   const { rows: masters } = await pool.query('SELECT * FROM masters WHERE is_active = true');
   const today = new Date();
@@ -951,7 +932,6 @@ bot.action('ADM_SCHEDULE', async (ctx) => {
 });
 
 bot.action('ADM_EXPORT', async (ctx) => {
-  await ctx.answerCbQuery();
   if (!isAdmin(ctx.from.id)) return;
   const { rows } = await pool.query(`
     SELECT a.id, a.start_time, m.name as master, s.name as service, s.price,
@@ -972,7 +952,6 @@ bot.action('ADM_EXPORT', async (ctx) => {
 });
 
 bot.action('ADM_BLOCK', async (ctx) => {
-  await ctx.answerCbQuery();
   if (!isAdmin(ctx.from.id)) return;
   return ctx.editMessageText(
     '🚫 *Блокировка слота*\n\n' +
