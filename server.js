@@ -287,6 +287,21 @@ function mainMenu(isAdminUser) {
   return Markup.inlineKeyboard(buttons);
 }
 
+// ════════ MIDDLEWARE: логирование + защита от падений ════════
+bot.use(async (ctx, next) => {
+  const cb = ctx.callbackQuery?.data;
+  if (cb) console.log(`[callback] ${ctx.from.id} → ${cb}`);
+  try {
+    await next();
+  } catch (err) {
+    console.error(`❌ Ошибка в обработчике (${cb || 'msg'}):`, err.message);
+    console.error(err.stack);
+    try {
+      if (ctx.callbackQuery) await ctx.answerCbQuery('Произошла ошибка, попробуй ещё раз');
+    } catch (e) {}
+  }
+});
+
 bot.start(async (ctx) => {
   if (!pool) return ctx.reply('⚠️ Бот пока не готов. Попробуйте через минуту.');
   await ensureUser(ctx);
