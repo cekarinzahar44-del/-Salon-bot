@@ -1029,21 +1029,39 @@ function startReminderScheduler() {
 }
 
 // ════════ ЗАПУСК ════════
+let botStarted = false;
 (async () => {
-  const dbOk = await initDB();
-  if (!dbOk) {
-    console.error('❌ БД недоступна. Бот не запустится.');
-    process.exit(1);
+  try {
+    console.log('▶️ Старт инициализации...');
+    const dbOk = await initDB();
+    if (!dbOk) {
+      console.error('❌ БД недоступна. Бот не запустится.');
+      return; // НЕ вызываем process.exit — пусть контейнер живёт, увидим логи
+    }
+    console.log('▶️ БД готова, запускаю планировщик...');
+    startReminderScheduler();
+
+    console.log('▶️ Запускаю бота...');
+    bot.catch(err => console.error('Bot runtime error:', err));
+    await bot.launch();
+    botStarted = true;
+    console.log(`🤖 ${SALON_NAME} bot launched`);
+    console.log(`👑 Admins: ${ADMIN_IDS.join(', ') || 'не заданы (укажи ADMIN_IDS)'}`);
+  } catch (err) {
+    console.error('❌ Критическая ошибка запуска:', err.message);
+    console.error(err.stack);
   }
-  startReminderScheduler();
-  bot.catch(err => console.error('Bot error:', err));
-  bot.launch()
-    .then(() => {
-      console.log(`🤖 ${SALON_NAME} bot launched`);
-      console.log(`👑 Admins: ${ADMIN_IDS.join(', ') || 'не заданы (укажи ADMIN_IDS)'}`);
-    })
-    .catch(err => console.error('❌ Bot launch failed:', err.message));
 })();
 
-process.on('SIGINT', () => { bot.stop('SIGINT'); process.exit(); });
-process.on('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(); });
+// Безопасное завершение — только если бот реально запущен
+function gracefulStop(signal) {
+  console.log(`Получен сигнал ${signal}`);
+  try {
+    if (botStarted) bot.stop(signal);
+  } catch (e) {
+    // бот не был запущен — игнорируем
+  }
+  process.exit(0);
+}
+process.on('SIGINT', () => gracefulStop('SIGINT'));
+process.on('SIGTERM', () => gracefulStop('SIGTERM'));
