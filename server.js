@@ -43,19 +43,31 @@ if (!BOT_TOKEN) {
 let pool = null;
 
 async function initDB() {
-  if (!process.env.DB_HOST || !process.env.DB_USER) {
-    console.warn('⚠️ Реквизиты БД не заданы (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME). Бот без БД не работает.');
+  const connectionString = process.env.DATABASE_URL || process.env.DB_URL;
+
+  if (!connectionString && (!process.env.DB_HOST || !process.env.DB_USER)) {
+    console.warn('⚠️ Реквизиты БД не заданы. Задай DATABASE_URL (строку подключения) ИЛИ DB_HOST/DB_USER/DB_PASSWORD/DB_NAME.');
     return false;
   }
   try {
-    pool = new Pool({
-      host: process.env.DB_HOST,
-      port: process.env.DB_PORT || 5432,
-      database: process.env.DB_NAME,
-      user: process.env.DB_USER,
-      password: process.env.DB_PASSWORD,
-      ssl: false
-    });
+    if (connectionString) {
+      // Строка вида postgresql://user:pass@host:port/dbname
+      pool = new Pool({
+        connectionString,
+        ssl: connectionString.includes('sslmode=require') ? { rejectUnauthorized: false } : false
+      });
+      console.log('🔗 Подключаюсь по DATABASE_URL');
+    } else {
+      pool = new Pool({
+        host: process.env.DB_HOST,
+        port: process.env.DB_PORT || 5432,
+        database: process.env.DB_NAME,
+        user: process.env.DB_USER,
+        password: process.env.DB_PASSWORD,
+        ssl: false
+      });
+      console.log('🔗 Подключаюсь по DB_HOST');
+    }
     const client = await pool.connect();
     console.log('✅ PostgreSQL подключён');
     client.release();
