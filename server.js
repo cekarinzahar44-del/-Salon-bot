@@ -51,13 +51,19 @@ async function initDB() {
   }
   try {
     const poolConfig = {
-      connectionTimeoutMillis: 10000, // 10 сек на подключение, иначе ошибка
+      connectionTimeoutMillis: 10000,
       idleTimeoutMillis: 30000,
-      max: 5
+      max: 5,
+      // Keepalive для предотвращения обрыва idle-соединений
+      keepAlive: true,
+      keepAliveInitialDelayMillis: 10000,
+      // Переподключение при ошибках
+      statement_timeout: 15000,      // максимум 15 сек на выполнение запроса
+      query_timeout: 15000,         // дублируем
+      connectionTimeoutMillis: 10000
     };
     if (connectionString) {
       poolConfig.connectionString = connectionString;
-      // Пробуем с SSL если требуется, иначе без
       poolConfig.ssl = connectionString.includes('sslmode=require')
         ? { rejectUnauthorized: false }
         : false;
@@ -73,7 +79,31 @@ async function initDB() {
     }
 
     pool = new Pool(poolConfig);
-    pool.on('error', (err) => console.error('⚠️ Pool error:', err.message));
+    
+    // Критически важный обработчик: пересоздаём пул при фатальных ошибках
+    pool.on('error', async (err) => {
+      console.error('⚠️ Pool error:', err.message);
+      if (err.message.includes('terminated') || 
+          err.message.includes('timeout') ||
+          err.message.includes('Connection terminated') ||
+          err.message.includes('Connection terminated unexpectedly')) {
+        console.log('🔄 Пересоздаю пул после фатальной ошибки...');
+        try {
+          const oldPool = pool;
+          pool = null;
+          await oldPool.end().catch(() => {});
+          await new Promise(r => setTimeout(r, 3000));
+          const dbOk = await initDB();
+          if (dbOk) {
+            console.log('✅ Пул успешно пересоздан');
+          } else {
+            console.error('❌ Не удалось пересоздать пул — попробую позже через Cron');
+          }
+        } catch (e) {
+          console.error('❌ Ошибка при пересоздании пула:', e.message);
+        }
+      }
+    });
 
     console.log('⏳ Пробую подключиться (таймаут 10с)...');
     const client = await pool.connect();
@@ -90,7 +120,6 @@ async function initDB() {
   } catch (e) {
     console.error('❌ Ошибка подключения к БД:', e.message);
     console.error('   Код:', e.code || 'нет кода');
-    // Если упало без SSL — подсказка
     if (e.message.includes('SSL') || e.message.includes('ssl')) {
       console.error('💡 Похоже нужен SSL. Добавь в конец DATABASE_URL: ?sslmode=require');
     }
@@ -223,7 +252,7 @@ async function seedInitialData() {
       serviceIds.push(r.rows[0].id);
     }
 
-    // Связь мастер-услуги: Анна - ногти(0-3), Мария - волосы(4-6), Елена - лицо(7-8), Ольга - брови(9-11)
+    // Связь мастер-услуги
     const links = [
       [m1.rows[0].id, [0,1,2,3]],
       [m2.rows[0].id, [4,5,6]],
@@ -236,7 +265,7 @@ async function seedInitialData() {
       }
     }
 
-    // График работы: все мастера Пн-Сб 10:00-20:00, Вс выходной
+    // График работы
     for (const mid of masterIds) {
       for (let d = 1; d <= 6; d++) {
         await pool.query(`INSERT INTO schedules (master_id, day_of_week, open_time, close_time) VALUES ($1,$2,$3,$4)`,
@@ -269,6 +298,7 @@ function fmtPrice(n) {
 }
 
 async function ensureUser(ctx) {
+  if (!pool) throw new Error('БД недоступна');
   const id = ctx.from.id;
   const name = ctx.from.first_name || 'Гость';
   const username = ctx.from.username || null;
@@ -310,14 +340,21 @@ bot.use(async (ctx, next) => {
   const cb = ctx.callbackQuery?.data;
   if (cb) {
     console.log(`[callback] ${ctx.from.id} → ${cb}`);
-    // СРАЗУ отвечаем Telegram, чтобы callback не "протух" пока работает БД
     try { await ctx.answerCbQuery(); } catch (e) {}
   }
   try {
     await next();
   } catch (err) {
     console.error(`❌ Ошибка в обработчике (${cb || 'msg'}):`, err.message);
-    console.error(err.stack);
+    // Пытаемся сообщить пользователю
+    try {
+      if (ctx.callbackQuery) {
+        await ctx.editMessageText('⚠️ Произошла ошибка. Попробуйте позже.', 
+          Markup.inlineKeyboard([[Markup.button.callback('← В меню', 'MAIN_MENU')]]));
+      } else {
+        await ctx.reply('⚠️ Произошла ошибка. Попробуйте позже.');
+      }
+    } catch (e) {}
   }
 });
 
@@ -338,6 +375,7 @@ bot.command('menu', async (ctx) => {
 
 // ════════ ИНФО О САЛОНЕ ════════
 bot.action('SHOW_INFO', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const text =
     `🏛 *${SALON_NAME}*\n\n` +
     `📍 *Адрес:* Москва, ул. Примерная, 1\n` +
@@ -352,6 +390,7 @@ bot.action('SHOW_INFO', async (ctx) => {
 
 // ════════ СПИСОК МАСТЕРОВ ════════
 bot.action('SHOW_MASTERS', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const { rows } = await pool.query('SELECT * FROM masters WHERE is_active = true ORDER BY id');
   let text = `💆 *Наши мастера* (${rows.length}):\n\n`;
   for (const m of rows) {
@@ -365,6 +404,7 @@ bot.action('SHOW_MASTERS', async (ctx) => {
 
 // ════════ СПИСОК УСЛУГ ════════
 bot.action('SHOW_SERVICES', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const { rows } = await pool.query(`
     SELECT s.*, COUNT(ms.master_id) as masters_count
     FROM services s
@@ -402,6 +442,7 @@ bot.action('MAIN_MENU', async (ctx) => {
 
 // ════════ ЗАПИСЬ: ШАГ 1 — Выбор категории ════════
 bot.action('BOOK_START', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   clearState(ctx.from.id);
   const text = `📅 *Запись*\n\nШаг 1 из 5 — выбери категорию услуг:`;
   return ctx.editMessageText(text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
@@ -413,6 +454,7 @@ bot.action('BOOK_START', async (ctx) => {
 
 // ШАГ 2 — Выбор услуги
 bot.action(/^CAT_(.+)$/, async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const cat = ctx.match[1];
   const { rows } = await pool.query(`SELECT * FROM services WHERE category = $1 AND is_active = true ORDER BY price`, [cat]);
   if (!rows.length) {
@@ -429,6 +471,7 @@ bot.action(/^CAT_(.+)$/, async (ctx) => {
 
 // ШАГ 3 — Выбор мастера
 bot.action(/^SVC_(\d+)$/, async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const serviceId = parseInt(ctx.match[1]);
   const { rows: sRows } = await pool.query('SELECT * FROM services WHERE id = $1', [serviceId]);
   if (!sRows.length) return ctx.editMessageText('Услуга не найдена');
@@ -456,6 +499,7 @@ bot.action(/^SVC_(\d+)$/, async (ctx) => {
 
 // ШАГ 4 — Выбор даты
 bot.action(/^MST_(\w+)$/, async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, начни заново /start');
   const masterId = ctx.match[1] === 'any' ? null : parseInt(ctx.match[1]);
@@ -466,15 +510,12 @@ bot.action(/^MST_(\w+)$/, async (ctx) => {
 
 async function showDatePicker(ctx, state) {
   const today = new Date();
-  const tzOffset = getTzOffset();
-  // Берём 14 дней вперёд
   const dates = [];
   for (let i = 0; i < 14; i++) {
     const d = new Date(today);
     d.setDate(d.getDate() + i);
     dates.push(d);
   }
-  // Группируем по 3 в ряд
   const buttons = [];
   for (let i = 0; i < dates.length; i += 3) {
     const row = dates.slice(i, i + 3).map(d => {
@@ -501,12 +542,12 @@ async function showDatePicker(ctx, state) {
 }
 
 function getTzOffset() {
-  // Москва = UTC+3
   return 3;
 }
 
 // ШАГ 5 — Выбор времени
 bot.action(/^DATE_(.+)$/, async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, /start');
   const dateStr = ctx.match[1];
@@ -521,7 +562,6 @@ bot.action(/^DATE_(.+)$/, async (ctx) => {
     );
   }
 
-  // Сгруппируем по утро/день/вечер для удобства
   const buttons = [];
   let row = [];
   for (const slot of slots) {
@@ -539,19 +579,18 @@ bot.action(/^DATE_(.+)$/, async (ctx) => {
 });
 
 bot.action('BACK_TO_DATE', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, /start');
   return showDatePicker(ctx, state);
 });
 
-// Расчёт свободных слотов
 async function calculateAvailableSlots(masterId, serviceId, dateStr) {
   const { rows: sRows } = await pool.query('SELECT duration_min FROM services WHERE id = $1', [serviceId]);
   if (!sRows.length) return [];
   const duration = sRows[0].duration_min;
-  const dayOfWeek = new Date(dateStr + 'T12:00:00').getDay(); // 0=вс, 6=сб
+  const dayOfWeek = new Date(dateStr + 'T12:00:00').getDay();
 
-  // Получаем мастеров для услуги
   let masterIds = [];
   if (masterId) {
     masterIds = [masterId];
@@ -565,15 +604,13 @@ async function calculateAvailableSlots(masterId, serviceId, dateStr) {
 
   const slots = [];
   for (const mid of masterIds) {
-    // График мастера на этот день
     const { rows: schedRows } = await pool.query(
       'SELECT open_time, close_time FROM schedules WHERE master_id = $1 AND day_of_week = $2',
       [mid, dayOfWeek]
     );
-    if (!schedRows.length) continue; // выходной
-    const sched = schedRows[0];
+    if (!schedRows.length) continue;
 
-    // Существующие записи мастера на день
+    const sched = schedRows[0];
     const dayStart = `${dateStr} 00:00:00`;
     const dayEnd = `${dateStr} 23:59:59`;
     const { rows: apps } = await pool.query(
@@ -594,7 +631,6 @@ async function calculateAvailableSlots(masterId, serviceId, dateStr) {
       end: new Date(b.end_time)
     }));
 
-    // Генерируем слоты по 30 мин
     const [openH, openM] = sched.open_time.split(':').map(Number);
     const [closeH, closeM] = sched.close_time.split(':').map(Number);
     const dayDate = new Date(dateStr + 'T00:00:00');
@@ -604,17 +640,15 @@ async function calculateAvailableSlots(masterId, serviceId, dateStr) {
     closeDate.setHours(closeH, closeM, 0, 0);
 
     const now = new Date();
-    const STEP = 30; // мин
+    const STEP = 30;
     let slot = new Date(openDate);
     while (slot < closeDate) {
       const slotEnd = new Date(slot.getTime() + duration * 60000);
       if (slotEnd > closeDate) break;
-      // Пропускаем если уже прошло
       if (slot.getTime() < now.getTime() + 60 * 60000) {
         slot = new Date(slot.getTime() + STEP * 60000);
         continue;
       }
-      // Проверяем не пересекается с занятыми
       const conflict = busy.some(b => slot < b.end && slotEnd > b.start);
       if (!conflict) {
         const hh = String(slot.getHours()).padStart(2, '0');
@@ -624,7 +658,7 @@ async function calculateAvailableSlots(masterId, serviceId, dateStr) {
       slot = new Date(slot.getTime() + STEP * 60000);
     }
   }
-  // Если "любой" — отсортируем по времени, оставим уникальные времена
+
   const seen = new Set();
   const unique = [];
   for (const s of slots.sort((a, b) => a.dateTime - b.dateTime)) {
@@ -638,6 +672,7 @@ async function calculateAvailableSlots(masterId, serviceId, dateStr) {
 
 // Подтверждение записи
 bot.action(/^SLOT_(\d+)_(\d{2}:\d{2})$/, async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const state = getState(ctx.from.id);
   if (!state.serviceId) return ctx.editMessageText('Сессия истекла, /start');
   const masterId = parseInt(ctx.match[1]);
@@ -688,6 +723,7 @@ bot.action('BACK_TO_CONFIRM', async (ctx) => {
 });
 
 bot.action('CONFIRM_BOOK', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const state = getState(ctx.from.id);
   if (!state.serviceId || !state.masterId || !state.time || !state.date) {
     return ctx.editMessageText('Сессия истекла, начни заново /start');
@@ -696,7 +732,6 @@ bot.action('CONFIRM_BOOK', async (ctx) => {
   const startTime = new Date(`${state.date}T${state.time}:00`);
   const endTime = new Date(startTime.getTime() + state.service.duration_min * 60000);
 
-  // Финальная проверка конфликта (на случай гонки)
   const { rows: conflict } = await pool.query(`
     SELECT id FROM appointments
     WHERE master_id = $1 AND status = 'confirmed'
@@ -737,7 +772,6 @@ bot.action('CONFIRM_BOOK', async (ctx) => {
     [Markup.button.callback('📋 Мои записи', 'MY_APPTS'), Markup.button.callback('← В меню', 'MAIN_MENU')]
   ])});
 
-  // Уведомить админов
   for (const adminId of ADMIN_IDS) {
     try {
       await bot.telegram.sendMessage(adminId,
@@ -780,6 +814,7 @@ bot.on('text', async (ctx) => {
 
 // ════════ МОИ ЗАПИСИ ════════
 bot.action('MY_APPTS', async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const { rows } = await pool.query(`
     SELECT a.*, m.name as master_name, s.name as service_name, s.price
     FROM appointments a
@@ -807,6 +842,7 @@ bot.action('MY_APPTS', async (ctx) => {
 });
 
 bot.action(/^CANCEL_(\d+)$/, async (ctx) => {
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const aptId = parseInt(ctx.match[1]);
   const { rows } = await pool.query(
     `SELECT * FROM appointments WHERE id = $1 AND user_id = $2`,
@@ -818,7 +854,6 @@ bot.action(/^CANCEL_(\d+)$/, async (ctx) => {
     [Markup.button.callback('📋 Мои записи', 'MY_APPTS')],
     [Markup.button.callback('← В меню', 'MAIN_MENU')]
   ]));
-  // Уведомить админа
   for (const adminId of ADMIN_IDS) {
     try {
       await bot.telegram.sendMessage(adminId, `❌ Клиент отменил запись #${aptId}`);
@@ -843,6 +878,7 @@ bot.action('ADMIN_MENU', async (ctx) => {
 
 bot.action('ADM_TODAY', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const today = new Date().toISOString().split('T')[0];
   const { rows } = await pool.query(`
     SELECT a.*, m.name as master_name, s.name as service_name, s.price
@@ -873,6 +909,7 @@ bot.action('ADM_TODAY', async (ctx) => {
 
 bot.action('ADM_STATS', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const stats = await pool.query(`
     SELECT
       COUNT(*) FILTER (WHERE status = 'confirmed' AND DATE(start_time) = CURRENT_DATE) as today,
@@ -899,7 +936,6 @@ bot.action('ADM_STATS', async (ctx) => {
     `  Выручка: ${fmtPrice(r.rev_month)}\n\n` +
     `*Всего клиентов:* ${r.unique_clients}`;
 
-  // Топ мастеров по записям за месяц
   const { rows: topMasters } = await pool.query(`
     SELECT m.name, COUNT(a.id) as cnt, COALESCE(SUM(s.price), 0) as revenue
     FROM appointments a
@@ -922,6 +958,7 @@ bot.action('ADM_STATS', async (ctx) => {
 
 bot.action('ADM_SCHEDULE', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
+  if (!pool) return ctx.editMessageText('⚠️ БД недоступна. Попробуйте позже.');
   const { rows: masters } = await pool.query('SELECT * FROM masters WHERE is_active = true');
   const today = new Date();
   let text = `📊 *Расписание на ближайшие 7 дней*\n\n`;
@@ -951,6 +988,7 @@ bot.action('ADM_SCHEDULE', async (ctx) => {
 
 bot.action('ADM_EXPORT', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
+  if (!pool) return ctx.reply('⚠️ БД недоступна. Попробуйте позже.');
   const { rows } = await pool.query(`
     SELECT a.id, a.start_time, m.name as master, s.name as service, s.price,
            a.client_name, a.client_phone, a.status
@@ -985,17 +1023,30 @@ bot.action('ADM_BLOCK', async (ctx) => {
 
 bot.command('masters_ids', async (ctx) => {
   if (!isAdmin(ctx.from.id)) return;
+  if (!pool) return ctx.reply('⚠️ БД недоступна.');
   const { rows } = await pool.query('SELECT id, name FROM masters ORDER BY id');
   let t = '*ID мастеров:*\n';
   for (const m of rows) t += `${m.id} — ${m.name}\n`;
   return ctx.replyWithMarkdown(t);
 });
 
-// ════════ НАПОМИНАНИЯ ЧЕРЕЗ CRON ════════
+// ════════ НАПОМИНАНИЯ ЧЕРЕЗ CRON (ИСПРАВЛЕНО) ════════
 function startReminderScheduler() {
-  // Проверяем каждые 5 минут
   cron.schedule('*/5 * * * *', async () => {
-    if (!pool) return;
+    // Проверка 1: пул инициализирован?
+    if (!pool) {
+      console.log('⏭ Cron: пул не инициализирован, пропускаю');
+      return;
+    }
+
+    // Проверка 2: БД жива?
+    try {
+      await pool.query('SELECT 1');
+    } catch (e) {
+      console.error('⏭ Cron: БД недоступна, пропускаю:', e.message);
+      return;
+    }
+
     try {
       // 24h reminders
       const { rows: r24 } = await pool.query(`
@@ -1013,9 +1064,12 @@ function startReminderScheduler() {
             `🔔 *Напоминание*\n\nЗавтра в ${fmtTime(a.start_time)} у тебя запись:\n` +
             `${a.sname} у мастера ${a.mname}\n\nЖдём! 💆`,
             { parse_mode: 'Markdown' });
-          await pool.query(`INSERT INTO notifications_sent (appointment_id, type) VALUES ($1, '24h')`, [a.id]);
-        } catch (e) { console.error('Notify 24h:', e.message); }
+          await pool.query(`INSERT INTO notifications_sent (appointment_id, type) VALUES ($1, '24h') ON CONFLICT DO NOTHING`, [a.id]);
+        } catch (e) { 
+          console.error('Notify 24h:', e.message);
+        }
       }
+
       // 2h reminders
       const { rows: r2 } = await pool.query(`
         SELECT a.id, a.user_id, a.start_time, m.name as mname, s.name as sname
@@ -1032,10 +1086,15 @@ function startReminderScheduler() {
             `⏰ *Напоминание*\n\nЧерез 2 часа в ${fmtTime(a.start_time)}:\n` +
             `${a.sname} у мастера ${a.mname}\n\nНе опаздывай! ✨`,
             { parse_mode: 'Markdown' });
-          await pool.query(`INSERT INTO notifications_sent (appointment_id, type) VALUES ($1, '2h')`, [a.id]);
-        } catch (e) { console.error('Notify 2h:', e.message); }
+          await pool.query(`INSERT INTO notifications_sent (appointment_id, type) VALUES ($1, '2h') ON CONFLICT DO NOTHING`, [a.id]);
+        } catch (e) { 
+          console.error('Notify 2h:', e.message);
+        }
       }
-    } catch (e) { console.error('Cron error:', e.message); }
+    } catch (e) {
+      console.error('Cron error:', e.message);
+      // Не крашим процесс, просто логируем
+    }
   }, { timezone: TIMEZONE });
   console.log('⏰ Планировщик напоминаний запущен');
 }
@@ -1047,10 +1106,13 @@ let botStarted = false;
     console.log('▶️ Старт инициализации...');
     const dbOk = await initDB();
     if (!dbOk) {
-      console.error('❌ БД недоступна. Бот не запустится.');
-      return; // НЕ вызываем process.exit — пусть контейнер живёт, увидим логи
+      console.error('❌ БД недоступна. Бот не запустится. Cron будет пытаться переподключиться.');
+      // Не выходим — пусть pool.on('error') попробует переподключиться
+    } else {
+      console.log('▶️ БД готова');
     }
-    console.log('▶️ БД готова, запускаю планировщик...');
+    
+    console.log('▶️ Запускаю планировщик...');
     startReminderScheduler();
 
     console.log('▶️ Запускаю бота...');
@@ -1065,15 +1127,31 @@ let botStarted = false;
   }
 })();
 
-// Безопасное завершение — только если бот реально запущен
+// Безопасное завершение
 function gracefulStop(signal) {
   console.log(`Получен сигнал ${signal}`);
   try {
     if (botStarted) bot.stop(signal);
+    if (pool) pool.end().catch(() => {});
   } catch (e) {
-    // бот не был запущен — игнорируем
+    // игнорируем
   }
   process.exit(0);
 }
 process.on('SIGINT', () => gracefulStop('SIGINT'));
 process.on('SIGTERM', () => gracefulStop('SIGTERM'));
+
+// Дополнительно: ловим необработанные ошибки, чтобы не крашиться
+process.on('uncaughtException', (err) => {
+  console.error('💥 Необработанная ошибка:', err.message);
+  // Не выходим, если это ошибка соединения
+  if (err.message.includes('Connection terminated')) {
+    console.log('🔄 Игнорируем фатальный выход из-за Connection terminated');
+  } else {
+    process.exit(1);
+  }
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('💥 Необработанный reject:', reason?.message || reason);
+  // Не выходим
+});
